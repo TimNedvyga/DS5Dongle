@@ -29,9 +29,9 @@
 #define WAKE_KEY_UP_SETTLE_US 200000   // 200 ms between attempts (or before DONE)
 #define WAKE_REQUEST_TIMEOUT_US 5000000
 #define WAKE_KEY_ATTEMPTS     2
-#define WAKE_DISCONNECT_DEBOUNCE_US 3000000  // 3s: only disconnect (and thereby power off) the
-                                             // controller after a sustained suspend; ignore brief
-                                             // hub-induced suspends while the host is awake.
+// Allow longer transient USB suspends during hibernate resume before disconnecting
+// (and thereby powering off) the controller. Real sleep/shutdown also waits 15s.
+#define WAKE_DISCONNECT_DEBOUNCE_US 15000000
 #define WAKE_RECONNECT_GRACE_US   5000000  // 5s: after a deliberate USB reconnect, ignore the
                                            // suspend it causes (it is not a host sleep).
                                            // Cleared early when the device re-mounts.
