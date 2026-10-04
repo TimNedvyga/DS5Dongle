@@ -233,8 +233,9 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
 }
 
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len) {
-    (void) instance;
+    (void) report;
     (void) len;
+    wake_on_usb_report_complete(instance);
 }
 
 #ifndef ENABLE_WAKE_HID

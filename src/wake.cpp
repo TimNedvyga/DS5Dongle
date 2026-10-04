@@ -30,7 +30,9 @@
 #define WAKE_REQUEST_TIMEOUT_US 5000000
 #define WAKE_KEY_ATTEMPTS     2
 #define WAKE_DISCONNECT_DEBOUNCE_US 3000000  // Normal sleep/shutdown: disconnect after 3s.
-#define WAKE_POST_WAKE_GRACE_US   15000000  // Allow USB to settle after a controller wake request.
+#define WAKE_RECOVERY_STABLE_US  10000000  // Require 10s of completed controller reports.
+#define WAKE_RECOVERY_REPORT_GAP_US 1000000 // A 1s gap restarts stability detection.
+#define WAKE_RECOVERY_TIMEOUT_US 120000000 // Failed wake: stop protecting after 2 minutes.
 #define WAKE_RECONNECT_GRACE_US   5000000  // 5s: after a deliberate USB reconnect, ignore the
                                            // suspend it causes (it is not a host sleep).
                                            // Cleared early when the device re-mounts.
@@ -76,9 +78,71 @@ static uint8_t prev_b9 = 0x00;
 static volatile uint64_t suspend_at_us = 0;
 // During a deliberate USB reconnect, ignore the suspend it triggers until this time.
 static volatile uint64_t reconnect_until_us = 0;
-// Protected by wake_cs. Survives USB resume/mount/suspend and wake-FSM timeouts;
-// only gates Bluetooth disconnect, never USB event processing.
-static uint64_t post_wake_until_us = 0;
+// Separate from the F15 FSM: sending wake keys does not prove USB has recovered.
+// All recovery fields are protected by wake_cs.
+enum recovery_state_t { RECOVERY_IDLE, RECOVERY_WAIT_USB, RECOVERY_VERIFY_USB };
+static recovery_state_t recovery_state = RECOVERY_IDLE;
+static uint64_t recovery_started_us = 0;
+static uint64_t recovery_stable_since_us = 0;
+static uint64_t recovery_last_report_us = 0;
+
+static void recovery_usb_changed(void) {
+    critical_section_enter_blocking(&wake_cs);
+    if (recovery_state != RECOVERY_IDLE) {
+        recovery_state = RECOVERY_WAIT_USB;
+        recovery_stable_since_us = 0;
+        recovery_last_report_us = 0;
+        WAKE_DBG("recovery -> WAIT_USB (USB changed)");
+    }
+    critical_section_exit(&wake_cs);
+}
+
+void wake_on_usb_report_complete(uint8_t instance) {
+    // Only the full controller interface proves the host is polling gamepad
+    // input. Wake-keyboard reports and merely queued transfers do not count.
+    if (instance != 0 || usb_keyboard_only || usb_reconfiguring ||
+        !tud_mounted() || tud_suspended()) return;
+    const uint64_t now = time_us_64();
+    critical_section_enter_blocking(&wake_cs);
+    if (recovery_state != RECOVERY_IDLE && !host_suspended) {
+        if (recovery_state != RECOVERY_VERIFY_USB ||
+            now - recovery_last_report_us >= WAKE_RECOVERY_REPORT_GAP_US) {
+            recovery_state = RECOVERY_VERIFY_USB;
+            recovery_stable_since_us = now;
+            WAKE_DBG("recovery -> VERIFY_USB (controller report completed)");
+        }
+        recovery_last_report_us = now;
+    }
+    critical_section_exit(&wake_cs);
+}
+
+extern "C" void tud_umount_cb(void) {
+    recovery_usb_changed();
+}
+
+static bool recovery_protects_disconnect(uint64_t now) {
+    const bool usb_ready = tud_mounted() && !tud_suspended() &&
+                           !usb_reconfiguring && !usb_keyboard_only;
+    critical_section_enter_blocking(&wake_cs);
+    if (recovery_state != RECOVERY_IDLE) {
+        if (now - recovery_started_us >= WAKE_RECOVERY_TIMEOUT_US) {
+            recovery_state = RECOVERY_IDLE;
+            WAKE_DBG("recovery timeout 120s -> IDLE");
+        } else if (recovery_state == RECOVERY_VERIFY_USB) {
+            if (!usb_ready || host_suspended ||
+                now - recovery_last_report_us >= WAKE_RECOVERY_REPORT_GAP_US) {
+                recovery_state = RECOVERY_WAIT_USB;
+                WAKE_DBG("recovery -> WAIT_USB (report stream interrupted)");
+            } else if (now - recovery_stable_since_us >= WAKE_RECOVERY_STABLE_US) {
+                recovery_state = RECOVERY_IDLE;
+                WAKE_DBG("recovery -> IDLE (10s stable controller transfers)");
+            }
+        }
+    }
+    const bool active = recovery_state != RECOVERY_IDLE;
+    critical_section_exit(&wake_cs);
+    return active;
+}
 
 static void enter_state(wake_state_t s) {
     state = s;
@@ -101,10 +165,13 @@ static void request_host_wake(const char *reason) {
         critical_section_enter_blocking(&wake_cs);
         state = WAKE_REQUESTED;
         state_entered_us = time_us_64();
-        // Repeated requests during USB re-enumeration must not keep extending
-        // the same protection window indefinitely if the host never resumes.
-        if (post_wake_until_us == 0) {
-            post_wake_until_us = state_entered_us + WAKE_POST_WAKE_GRACE_US;
+        // Retries never restart the overall failed-wake timeout.
+        if (recovery_state == RECOVERY_IDLE) {
+            recovery_state = RECOVERY_WAIT_USB;
+            recovery_started_us = state_entered_us;
+            recovery_stable_since_us = 0;
+            recovery_last_report_us = 0;
+            WAKE_DBG("recovery -> WAIT_USB (wake requested)");
         }
         critical_section_exit(&wake_cs);
         WAKE_DBG("%s -> REQUESTED", reason);
@@ -128,11 +195,13 @@ void wake_init(void) {
 // Called right before a deliberate USB reconnect (FUNC_RECONNECT): arm a grace window so the
 // suspend the reconnect causes is ignored, and drop any already-pending disconnect.
 void wake_note_usb_reconnect(void) {
+    recovery_usb_changed();
     reconnect_until_us = time_us_64() + WAKE_RECONNECT_GRACE_US;
     suspend_at_us = 0;
 }
 
 extern "C" void tud_suspend_cb(bool remote_wakeup_en) {
+    recovery_usb_changed();
     WAKE_DBG("tud_suspend_cb remote_wakeup_en=%d prev_state=%s",
              (int)remote_wakeup_en, wake_state_name(state));
     // A deliberate Reconnect USB (FUNC_RECONNECT) tears the bus down and back up, which looks
@@ -176,6 +245,7 @@ void wake_on_bt_connect(void) {
 }
 
 extern "C" void tud_resume_cb(void) {
+    recovery_usb_changed();
     WAKE_DBG("tud_resume_cb state=%s", wake_state_name(state));
     host_suspended = false;
     host_resumed_event = true;
@@ -193,6 +263,7 @@ extern "C" void tud_resume_cb(void) {
 }
 
 extern "C" void tud_mount_cb(void) {
+    recovery_usb_changed();
     usb_reconfiguring = false;
     WAKE_DBG("tud_mount_cb state=%s", wake_state_name(state));
     host_suspended = false;
@@ -253,7 +324,7 @@ void wake_on_bt_input(const uint8_t *hid_input, uint16_t len) {
 
 void wake_on_bt_disconnect(void) {
     critical_section_enter_blocking(&wake_cs);
-    post_wake_until_us = 0;
+    recovery_state = RECOVERY_IDLE;
     state = WAKE_IDLE;
     prev_b7 = 0x08; prev_b8 = 0x00; prev_b9 = 0x00;
     critical_section_exit(&wake_cs);
@@ -267,14 +338,11 @@ void wake_task(void) {
     // window (a genuine host sleep/shutdown). Runs regardless of enable_wake -- it is a
     // battery-save, not part of the wake-UP path. A transient hub suspend will already have
     // been cancelled by tud_resume_cb / tud_mount_cb before this fires.
-    // A controller-triggered wake gets a separate bounded grace window. Keep
-    // processing USB events normally, including any new suspend during resume.
-    critical_section_enter_blocking(&wake_cs);
-    const bool wake_grace_active = now < post_wake_until_us;
-    if (!wake_grace_active) post_wake_until_us = 0;
-    critical_section_exit(&wake_cs);
+    // Recovery ends on sustained completed USB transfers, not the F15 FSM or
+    // the first resume callback. USB events remain fully processed throughout.
+    const bool recovery_active = recovery_protects_disconnect(now);
     if (suspend_at_us != 0 && host_suspended &&
-        !wake_grace_active &&
+        !recovery_active &&
         now - suspend_at_us >= WAKE_DISCONNECT_DEBOUNCE_US) {
         bt_disconnect();
         suspend_at_us = 0;
