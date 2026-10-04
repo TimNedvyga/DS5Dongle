@@ -24,7 +24,14 @@ bool bt_disconnect() { ++disconnects; return true; }
 void ps_shortcut_reset() {}
 bool usb_keyboard_only = false, usb_reconfiguring = false;
 uint8_t usb_keyboard_instance() { return usb_keyboard_only ? 0 : 1; }
-void usb_reconnect(bool) {}
+int usb_reconnect_calls = 0;
+void wake_note_usb_reconnect(void);
+void usb_reconnect(bool keyboard_only) {
+    ++usb_reconnect_calls;
+    wake_note_usb_reconnect();
+    usb_keyboard_only = keyboard_only;
+    usb_reconfiguring = true;
+}
 bool mounted = true, suspended = false;
 bool tud_mounted() { return mounted; }
 bool tud_suspended() { return suspended; }
@@ -42,6 +49,7 @@ void reset() {
     suspend_at_us = 0; reconnect_until_us = 0;
     recovery_state = RECOVERY_IDLE;
     recovery_started_us = recovery_stable_since_us = recovery_last_report_us = 0;
+    recovery_reconnect_after_us = 0; recovery_reconnects = 0; usb_reconnect_calls = 0;
     state = WAKE_IDLE; state_entered_us = 0; key_attempts = 0;
     wake_init();
 }
@@ -69,6 +77,7 @@ int main() {
     check(recovery_state != RECOVERY_IDLE, "mount alone is not recovery");
     wake_on_usb_report_complete(1); advance(10000000);
     check(recovery_state == RECOVERY_WAIT_USB, "keyboard reports do not prove controller recovery");
+    tud_mount_cb(); // Complete any repair re-enumeration before host polling.
     reports(9); check(recovery_state == RECOVERY_VERIFY_USB, "not stable before 10s");
     reports(1); check(recovery_state == RECOVERY_IDLE && disconnects == 0, "stable report stream ends recovery");
     suspend_usb(); advance(3000000); check(disconnects == 1, "later sleep uses 3s");
@@ -106,5 +115,25 @@ int main() {
     check(recovery_state == RECOVERY_IDLE, "rejected request does not protect");
     start_wake(); check(forced_wakes == 1 && recovery_state != RECOVERY_IDLE, "forced DCD wake starts recovery");
     wake_on_bt_disconnect(); check(recovery_state == RECOVERY_IDLE, "BT disconnect clears recovery");
+    reset(); start_wake(); resume_usb(); usb_reconfiguring = true;
+    advance(WAKE_RECOVERY_NO_REPORT_US - 1);
+    check(usb_reconnect_calls == 0, "no repair before observation window");
+    advance(1);
+    check(usb_reconnect_calls == 1 && disconnects == 0, "repair stuck reconfiguring without dropping BT");
+    tud_mount_cb(); reports(10);
+    check(recovery_state == RECOVERY_IDLE && usb_reconnect_calls == 1, "reports stop repairs and complete recovery");
+
+    reset(); start_wake(); resume_usb();
+    advance(WAKE_RECOVERY_NO_REPORT_US);
+    advance(WAKE_RECOVERY_RETRY_US - 1);
+    check(usb_reconnect_calls == 1, "retry interval respected");
+    advance(1); advance(WAKE_RECOVERY_RETRY_US); advance(WAKE_RECOVERY_RETRY_US);
+    check(usb_reconnect_calls == 3, "USB repair attempts bounded");
+    reset(); start_wake(); advance(30000000);
+    check(usb_reconnect_calls == 0, "never reconnect a sleeping host");
+    resume_usb(); mounted = false; advance(30000000);
+    check(usb_reconnect_calls == 0, "never retry before enumeration");
+    reset(); advance(30000000);
+    check(usb_reconnect_calls == 0, "no repair outside wake recovery");
     std::puts("PASS: USB wake recovery scenarios");
 }

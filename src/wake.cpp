@@ -33,6 +33,9 @@
 #define WAKE_RECOVERY_STABLE_US  10000000  // Require 10s of completed controller reports.
 #define WAKE_RECOVERY_REPORT_GAP_US 1000000 // A 1s gap restarts stability detection.
 #define WAKE_RECOVERY_TIMEOUT_US 120000000 // Failed wake: stop protecting after 2 minutes.
+#define WAKE_RECOVERY_NO_REPORT_US 5000000 // Active USB without input: try re-enumeration.
+#define WAKE_RECOVERY_RETRY_US   10000000
+#define WAKE_RECOVERY_MAX_RECONNECTS 3
 #define WAKE_RECONNECT_GRACE_US   5000000  // 5s: after a deliberate USB reconnect, ignore the
                                            // suspend it causes (it is not a host sleep).
                                            // Cleared early when the device re-mounts.
@@ -85,6 +88,8 @@ static recovery_state_t recovery_state = RECOVERY_IDLE;
 static uint64_t recovery_started_us = 0;
 static uint64_t recovery_stable_since_us = 0;
 static uint64_t recovery_last_report_us = 0;
+static uint64_t recovery_reconnect_after_us = 0;
+static uint8_t recovery_reconnects = 0;
 
 static void recovery_usb_changed(void) {
     critical_section_enter_blocking(&wake_cs);
@@ -92,6 +97,9 @@ static void recovery_usb_changed(void) {
         recovery_state = RECOVERY_WAIT_USB;
         recovery_stable_since_us = 0;
         recovery_last_report_us = 0;
+        const uint64_t settle_until = time_us_64() + WAKE_RECOVERY_NO_REPORT_US;
+        if (recovery_reconnect_after_us < settle_until)
+            recovery_reconnect_after_us = settle_until;
         WAKE_DBG("recovery -> WAIT_USB (USB changed)");
     }
     critical_section_exit(&wake_cs);
@@ -112,6 +120,7 @@ void wake_on_usb_report_complete(uint8_t instance) {
             WAKE_DBG("recovery -> VERIFY_USB (controller report completed)");
         }
         recovery_last_report_us = now;
+        recovery_reconnect_after_us = now + WAKE_RECOVERY_NO_REPORT_US;
     }
     critical_section_exit(&wake_cs);
 }
@@ -149,6 +158,31 @@ static void enter_state(wake_state_t s) {
     state_entered_us = time_us_64();
 }
 
+static bool recovery_reconnect_stalled_usb(uint64_t now) {
+    // A missing mount is not proof the PC has resumed. Only repair an already
+    // configured, awake full controller interface, and leave Bluetooth intact.
+    // usb_reconfiguring is deliberately NOT a gate: a missed mount callback
+    // can leave it stuck true and block all input even though EP0 still works.
+    if (!bt_is_connected() || !tud_mounted() || tud_suspended() ||
+        usb_keyboard_only) return false;
+    critical_section_enter_blocking(&wake_cs);
+    const bool retry = recovery_state != RECOVERY_IDLE &&
+        now >= recovery_reconnect_after_us &&
+        recovery_reconnects < WAKE_RECOVERY_MAX_RECONNECTS;
+    if (retry) {
+        ++recovery_reconnects;
+        recovery_reconnect_after_us = now + WAKE_RECOVERY_RETRY_US;
+    }
+    critical_section_exit(&wake_cs);
+    if (retry) {
+        WAKE_DBG("recovery: active USB without controller reports -> reconnect (%u/3)",
+                 (unsigned)recovery_reconnects);
+        // Run from wake_task, never from a TinyUSB callback or under wake_cs.
+        usb_reconnect(false);
+    }
+    return retry;
+}
+
 static void request_host_wake(const char *reason) {
     bool ok = tud_remote_wakeup();
 
@@ -171,6 +205,8 @@ static void request_host_wake(const char *reason) {
             recovery_started_us = state_entered_us;
             recovery_stable_since_us = 0;
             recovery_last_report_us = 0;
+            recovery_reconnect_after_us = state_entered_us + WAKE_RECOVERY_NO_REPORT_US;
+            recovery_reconnects = 0;
             WAKE_DBG("recovery -> WAIT_USB (wake requested)");
         }
         critical_section_exit(&wake_cs);
@@ -341,6 +377,7 @@ void wake_task(void) {
     // Recovery ends on sustained completed USB transfers, not the F15 FSM or
     // the first resume callback. USB events remain fully processed throughout.
     const bool recovery_active = recovery_protects_disconnect(now);
+    if (recovery_active && recovery_reconnect_stalled_usb(now)) return;
     if (suspend_at_us != 0 && host_suspended &&
         !recovery_active &&
         now - suspend_at_us >= WAKE_DISCONNECT_DEBOUNCE_US) {

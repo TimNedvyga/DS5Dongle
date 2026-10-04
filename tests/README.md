@@ -21,5 +21,8 @@ build\wake-recovery-test.exe
 
 Covers ordinary sleep, slow wake, repeated suspend/resume, remount/unmount,
 interrupted report streams, keyboard-only enumeration, failed wake timeout,
-disabled wake, and Bluetooth disconnect. USB transfer completion is simulated;
+disabled wake, Bluetooth disconnect, and bounded USB-only repair of an active
+interface with no controller reports (including a stuck reconfiguration flag).
+Checks that repair never runs while suspended, unmounted, or outside recovery.
+USB transfer completion is simulated;
 firmware compilation and real hardware testing are still required.
