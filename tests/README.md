@@ -19,10 +19,9 @@ cl /nologo /EHsc /std:c++20 /Itests\wake_stubs tests\wake_recovery.cpp /Febuild\
 build\wake-recovery-test.exe
 ```
 
-Covers ordinary sleep, slow wake, repeated suspend/resume, remount/unmount,
-interrupted report streams, keyboard-only enumeration, failed wake timeout,
-disabled wake, Bluetooth disconnect, and bounded USB-only repair of an active
-interface with no controller reports (including a stuck reconfiguration flag).
-Checks that repair never runs while suspended, unmounted, or outside recovery.
-USB transfer completion is simulated;
-firmware compilation and real hardware testing are still required.
+Covers the 3s ordinary sleep debounce, 30s from each wake-related suspend,
+repeated USB transitions lasting more than a minute, old suspend timestamps,
+retry bounds, return to normal after 30s continuously resumed, disabled wake,
+and Bluetooth disconnect. There is no report-stream detector or automatic
+USB reconnect in this variant. Firmware compilation and hardware tests of
+Sleep, Hibernate, and Sleep-to-Hibernate are still required.

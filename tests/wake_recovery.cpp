@@ -36,104 +36,46 @@ bool mounted = true, suspended = false;
 bool tud_mounted() { return mounted; }
 bool tud_suspended() { return suspended; }
 #include "../src/wake.cpp"
-
-void check(bool ok, const char *message) {
-    if (!ok) { std::fprintf(stderr, "FAIL: %s\n", message); std::exit(1); }
-}
+void check(bool ok, const char *msg) { if (!ok) { std::fprintf(stderr,"FAIL: %s\n",msg); std::exit(1); } }
 void reset() {
-    clock_us = 1000000; disconnects = 0; forced_wakes = 0;
-    remote_ok = true; config.enable_wake = true;
-    mounted = true; suspended = false;
-    usb_keyboard_only = false; usb_reconfiguring = false;
-    host_suspended = false; host_resumed_event = false;
-    suspend_at_us = 0; reconnect_until_us = 0;
-    recovery_state = RECOVERY_IDLE;
-    recovery_started_us = recovery_stable_since_us = recovery_last_report_us = 0;
-    recovery_reconnect_after_us = 0; recovery_reconnects = 0; usb_reconnect_calls = 0;
-    state = WAKE_IDLE; state_entered_us = 0; key_attempts = 0;
-    wake_init();
+ clock_us=1000000; disconnects=0; forced_wakes=0; remote_ok=true;
+ config.enable_wake=true; host_suspended=false; host_resumed_event=false;
+ suspend_at_us=0; reconnect_until_us=0; wake_in_progress=false;
+ wake_resumed_at_us=0; suspend_debounce_us=WAKE_DISCONNECT_DEBOUNCE_US;
+ state=WAKE_IDLE; state_entered_us=0; key_attempts=0; usb_reconnect_calls=0;
+ usb_keyboard_only=false; usb_reconfiguring=false; wake_init();
 }
-void suspend_usb() { suspended = true; tud_suspend_cb(true); }
-void resume_usb() { suspended = false; tud_resume_cb(); }
-void advance(uint64_t us) { clock_us += us; wake_task(); }
-void reports(unsigned seconds) {
-    // 10Hz is deliberately much slower than real gamepad input polling.
-    wake_on_usb_report_complete(0);
-    for (unsigned i = 0; i < seconds * 10; ++i) {
-        clock_us += 100000;
-        wake_on_usb_report_complete(0);
-        wake_task();
-    }
-}
-void start_wake() { suspend_usb(); wake_on_bt_connect(); }
+void step(uint64_t us) { clock_us+=us; wake_task(); }
+void start() { tud_suspend_cb(true); wake_on_bt_connect(); }
 int main() {
-    reset(); suspend_usb(); advance(2999999);
-    check(disconnects == 0, "normal sleep before 3s");
-    advance(1); check(disconnects == 1, "normal sleep at 3s");
-
-    reset(); start_wake(); advance(60000000);
-    check(disconnects == 0 && recovery_state != RECOVERY_IDLE, "slow wake protected beyond 15s");
-    resume_usb(); tud_mount_cb(); advance(10000000);
-    check(recovery_state != RECOVERY_IDLE, "mount alone is not recovery");
-    wake_on_usb_report_complete(1); advance(10000000);
-    check(recovery_state == RECOVERY_WAIT_USB, "keyboard reports do not prove controller recovery");
-    tud_mount_cb(); // Complete any repair re-enumeration before host polling.
-    reports(9); check(recovery_state == RECOVERY_VERIFY_USB, "not stable before 10s");
-    reports(1); check(recovery_state == RECOVERY_IDLE && disconnects == 0, "stable report stream ends recovery");
-    suspend_usb(); advance(3000000); check(disconnects == 1, "later sleep uses 3s");
-
-    reset(); start_wake(); resume_usb(); reports(9); suspend_usb();
-    check(recovery_state == RECOVERY_WAIT_USB && host_suspended, "resuspend resets evidence and updates USB state");
-    advance(20000000); check(disconnects == 0, "resuspend remains protected");
-    resume_usb(); reports(9); check(recovery_state != RECOVERY_IDLE, "new stability window after resuspend");
-    reports(1); check(recovery_state == RECOVERY_IDLE, "new window completes");
-
-    reset(); start_wake(); resume_usb(); reports(9); advance(1000000);
-    check(recovery_state == RECOVERY_WAIT_USB, "report gap resets stability");
-    reports(9); check(recovery_state != RECOVERY_IDLE, "gap needs another full window");
-    tud_mount_cb(); check(recovery_state == RECOVERY_WAIT_USB, "remount resets stability");
-    reports(9); mounted = false; tud_umount_cb();
-    check(recovery_state == RECOVERY_WAIT_USB, "unmount resets stability");
-    wake_on_usb_report_complete(0); check(recovery_state == RECOVERY_WAIT_USB, "unmounted completion ignored");
-    mounted = true; reports(9); usb_reconfiguring = true; advance(1);
-    check(recovery_state == RECOVERY_WAIT_USB, "reconfiguration invalidates stream");
-    usb_reconfiguring = false; usb_keyboard_only = true; reports(11);
-    check(recovery_state == RECOVERY_WAIT_USB, "keyboard-only enumeration does not count");
-
-    reset(); start_wake(); const auto started = recovery_started_us;
-    advance(60000000); wake_on_bt_connect();
-    check(recovery_started_us == started, "wake retries do not extend emergency timeout");
-    clock_us = started + WAKE_RECOVERY_TIMEOUT_US - 1; wake_task();
-    check(disconnects == 0, "protected before emergency deadline");
-    advance(1); check(disconnects == 1 && recovery_state == RECOVERY_IDLE, "stuck wake disconnects at 120s");
-
-    reset(); start_wake(); resume_usb(); advance(WAKE_RECOVERY_TIMEOUT_US);
-    check(disconnects == 0 && recovery_state == RECOVERY_IDLE, "timeout never disconnects awake host");
-    reset(); config.enable_wake = false; start_wake(); advance(3000000);
-    check(disconnects == 1 && recovery_state == RECOVERY_IDLE, "disabled wake keeps normal sleep behavior");
-    reset(); remote_ok = false; request_host_wake("test awake");
-    check(recovery_state == RECOVERY_IDLE, "rejected request does not protect");
-    start_wake(); check(forced_wakes == 1 && recovery_state != RECOVERY_IDLE, "forced DCD wake starts recovery");
-    wake_on_bt_disconnect(); check(recovery_state == RECOVERY_IDLE, "BT disconnect clears recovery");
-    reset(); start_wake(); resume_usb(); usb_reconfiguring = true;
-    advance(WAKE_RECOVERY_NO_REPORT_US - 1);
-    check(usb_reconnect_calls == 0, "no repair before observation window");
-    advance(1);
-    check(usb_reconnect_calls == 1 && disconnects == 0, "repair stuck reconfiguring without dropping BT");
-    tud_mount_cb(); reports(10);
-    check(recovery_state == RECOVERY_IDLE && usb_reconnect_calls == 1, "reports stop repairs and complete recovery");
-
-    reset(); start_wake(); resume_usb();
-    advance(WAKE_RECOVERY_NO_REPORT_US);
-    advance(WAKE_RECOVERY_RETRY_US - 1);
-    check(usb_reconnect_calls == 1, "retry interval respected");
-    advance(1); advance(WAKE_RECOVERY_RETRY_US); advance(WAKE_RECOVERY_RETRY_US);
-    check(usb_reconnect_calls == 3, "USB repair attempts bounded");
-    reset(); start_wake(); advance(30000000);
-    check(usb_reconnect_calls == 0, "never reconnect a sleeping host");
-    resume_usb(); mounted = false; advance(30000000);
-    check(usb_reconnect_calls == 0, "never retry before enumeration");
-    reset(); advance(30000000);
-    check(usb_reconnect_calls == 0, "no repair outside wake recovery");
-    std::puts("PASS: USB wake recovery scenarios");
+ reset(); tud_suspend_cb(true); step(2999999); check(!disconnects,"sleep before 3s");
+ step(1); check(disconnects==1,"sleep at 3s");
+ reset(); start(); step(29999999); check(!disconnects,"wake before 30s");
+ step(1); check(disconnects==1,"failed wake at 30s");
+ reset(); start(); step(20000000); tud_resume_cb(); step(1000000); tud_suspend_cb(true);
+ step(29999999); check(!disconnects,"resuspend gets full 30s even past request deadline");
+ step(1); check(disconnects==1,"resuspend deadline");
+ reset(); start(); step(25000000); tud_resume_cb(); tud_mount_cb();
+ step(1000000); tud_suspend_cb(true); step(25000000); tud_resume_cb();
+ step(1000000); tud_suspend_cb(true); step(25000000);
+ check(!disconnects,"repeated resume/suspend can exceed 60s total");
+ tud_resume_cb(); step(30000000); check(!wake_in_progress,"30s resumed returns to normal");
+ tud_suspend_cb(true); step(3000000); check(disconnects==1,"later sleep takes 3s");
+ reset(); tud_suspend_cb(true); clock_us+=3600000000ULL; wake_on_bt_connect();
+ step(29999999); check(!disconnects,"old suspend reset on new wake");
+ step(1); check(disconnects==1,"old suspend bounded from new wake");
+ reset(); start(); step(6000000); wake_on_bt_connect(); step(24000000);
+ check(disconnects==1,"retries without USB event do not extend timeout");
+ reset(); start(); tud_resume_cb(); step(29000000); tud_suspend_cb(true);
+ step(29999999); check(!disconnects,"late suspend retains chosen 30s debounce");
+ step(1); check(disconnects==1,"late suspend expires");
+ reset(); start(); wake_on_bt_disconnect(); tud_suspend_cb(true); step(3000000);
+ check(disconnects==1 && !wake_in_progress,"BT disconnect resets wake mode");
+ reset(); config.enable_wake=false; start(); step(3000000);
+ check(disconnects==1 && !wake_in_progress,"disabled wake uses 3s");
+ reset(); remote_ok=false; request_host_wake("awake"); check(!wake_in_progress,"rejected request");
+ start(); check(forced_wakes==1 && wake_in_progress,"forced remote wake");
+ reset(); start(); tud_resume_cb(); step(120000000);
+ check(!disconnects && !usb_reconnect_calls,"no automatic USB reconnect or report dependency");
+ std::puts("PASS: 3s sleep / 30s per-suspend wake debounce");
 }
