@@ -29,9 +29,8 @@
 #define WAKE_KEY_UP_SETTLE_US 200000   // 200 ms between attempts (or before DONE)
 #define WAKE_REQUEST_TIMEOUT_US 5000000
 #define WAKE_KEY_ATTEMPTS     2
-// Allow longer transient USB suspends during hibernate resume before disconnecting
-// (and thereby powering off) the controller. Real sleep/shutdown also waits 15s.
-#define WAKE_DISCONNECT_DEBOUNCE_US 15000000
+#define WAKE_DISCONNECT_DEBOUNCE_US 3000000  // Normal sleep/shutdown: disconnect after 3s.
+#define WAKE_POST_WAKE_GRACE_US   15000000  // Allow USB to settle after a controller wake request.
 #define WAKE_RECONNECT_GRACE_US   5000000  // 5s: after a deliberate USB reconnect, ignore the
                                            // suspend it causes (it is not a host sleep).
                                            // Cleared early when the device re-mounts.
@@ -77,6 +76,9 @@ static uint8_t prev_b9 = 0x00;
 static volatile uint64_t suspend_at_us = 0;
 // During a deliberate USB reconnect, ignore the suspend it triggers until this time.
 static volatile uint64_t reconnect_until_us = 0;
+// Protected by wake_cs. Survives USB resume/mount/suspend and wake-FSM timeouts;
+// only gates Bluetooth disconnect, never USB event processing.
+static uint64_t post_wake_until_us = 0;
 
 static void enter_state(wake_state_t s) {
     state = s;
@@ -99,6 +101,11 @@ static void request_host_wake(const char *reason) {
         critical_section_enter_blocking(&wake_cs);
         state = WAKE_REQUESTED;
         state_entered_us = time_us_64();
+        // Repeated requests during USB re-enumeration must not keep extending
+        // the same protection window indefinitely if the host never resumes.
+        if (post_wake_until_us == 0) {
+            post_wake_until_us = state_entered_us + WAKE_POST_WAKE_GRACE_US;
+        }
         critical_section_exit(&wake_cs);
         WAKE_DBG("%s -> REQUESTED", reason);
     }
@@ -246,6 +253,7 @@ void wake_on_bt_input(const uint8_t *hid_input, uint16_t len) {
 
 void wake_on_bt_disconnect(void) {
     critical_section_enter_blocking(&wake_cs);
+    post_wake_until_us = 0;
     state = WAKE_IDLE;
     prev_b7 = 0x08; prev_b8 = 0x00; prev_b9 = 0x00;
     critical_section_exit(&wake_cs);
@@ -259,7 +267,14 @@ void wake_task(void) {
     // window (a genuine host sleep/shutdown). Runs regardless of enable_wake -- it is a
     // battery-save, not part of the wake-UP path. A transient hub suspend will already have
     // been cancelled by tud_resume_cb / tud_mount_cb before this fires.
+    // A controller-triggered wake gets a separate bounded grace window. Keep
+    // processing USB events normally, including any new suspend during resume.
+    critical_section_enter_blocking(&wake_cs);
+    const bool wake_grace_active = now < post_wake_until_us;
+    if (!wake_grace_active) post_wake_until_us = 0;
+    critical_section_exit(&wake_cs);
     if (suspend_at_us != 0 && host_suspended &&
+        !wake_grace_active &&
         now - suspend_at_us >= WAKE_DISCONNECT_DEBOUNCE_US) {
         bt_disconnect();
         suspend_at_us = 0;
