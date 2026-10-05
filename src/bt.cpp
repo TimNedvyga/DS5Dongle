@@ -111,6 +111,10 @@ void bt_send_control(uint8_t *data, uint16_t len) {
     }
 }
 
+bool bt_is_connected() {
+    return hid_interrupt_cid != 0;
+}
+
 bool bt_disconnect() {
     if (acl_handle == HCI_CON_HANDLE_INVALID) {
         return false;
@@ -613,6 +617,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             hid_control_cid = 0;
             hid_interrupt_cid = 0;
             while (queue_try_remove(&send_fifo, NULL)) {}
+            wake_on_bt_disconnect();
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, false);
 #if ENABLE_BATT_LED
             battery_led_on_disconnect();
