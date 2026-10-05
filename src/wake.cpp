@@ -28,7 +28,7 @@
 #define WAKE_KEY_UP_SETTLE_US 200000   // 200 ms between attempts (or before DONE)
 #define WAKE_REQUEST_TIMEOUT_US 5000000
 #define WAKE_KEY_ATTEMPTS     2
-#define WAKE_POWEROFF_DEBOUNCE_US 3000000  // 3s: only power off the controller after a
+#define WAKE_POWEROFF_DEBOUNCE_US 30000000 // 30s: only power off the controller after a
                                            // sustained suspend (real sleep); ignore brief
                                            // hub-induced suspends while the host is awake.
 #define WAKE_RECONNECT_GRACE_US   5000000  // 5s: after a deliberate USB reconnect, ignore the
